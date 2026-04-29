@@ -183,6 +183,33 @@ def _dump_raw_iteration(
         )
 
 
+def _reduce_max_tokens_for_context_error(
+    error: Exception,
+    requested_max_tokens: int,
+    *,
+    safety_margin: int = 32,
+) -> int | None:
+    message = str(error)
+    match = re.search(
+        r"maximum context length is\s+(\d+)\s+tokens\s+and your request has\s+(\d+)\s+input tokens",
+        message,
+        re.IGNORECASE,
+    )
+    if not match:
+        return None
+
+    max_context_tokens = int(match.group(1))
+    input_tokens = int(match.group(2))
+    allowed_max_tokens = max_context_tokens - input_tokens - safety_margin
+    if allowed_max_tokens < 1:
+        return None
+
+    adjusted_max_tokens = min(requested_max_tokens, allowed_max_tokens)
+    if adjusted_max_tokens >= requested_max_tokens:
+        return None
+    return adjusted_max_tokens
+
+
 def run_conversation_with_tools(
     client: OpenAI,
     *,
@@ -226,18 +253,37 @@ def run_conversation_with_tools(
             print(f"Warning: Reached global max_tokens output budget ({global_max_tokens})")
             break
 
-        create_kwargs = {
-            "model": model,
-            "messages": messages,
-            "tools": tools,
-            "max_tokens": remaining_tokens,
-        }
-        if temperature is not None:
-            create_kwargs["temperature"] = temperature
-        if top_p is not None:
-            create_kwargs["top_p"] = top_p
+        request_max_tokens = remaining_tokens
+        while True:
+            create_kwargs = {
+                "model": model,
+                "messages": messages,
+                "tools": tools,
+                "max_tokens": request_max_tokens,
+            }
+            if temperature is not None:
+                create_kwargs["temperature"] = temperature
+            if top_p is not None:
+                create_kwargs["top_p"] = top_p
 
-        completion = client.chat.completions.create(**create_kwargs)
+            try:
+                completion = client.chat.completions.create(**create_kwargs)
+                break
+            except Exception as exc:
+                adjusted_max_tokens = _reduce_max_tokens_for_context_error(
+                    exc,
+                    request_max_tokens,
+                )
+                if adjusted_max_tokens is None:
+                    raise
+
+                print(
+                    "Warning: Reducing max_tokens from "
+                    f"{request_max_tokens} to {adjusted_max_tokens} for iteration "
+                    f"{iteration_index} due to context budget."
+                )
+                request_max_tokens = adjusted_max_tokens
+
         completion_dict = completion.model_dump(mode="python")
 
         choice = completion.choices[0]
@@ -409,7 +455,7 @@ def _process_tsv_dataset(tsv_path: str, client: OpenAI, args, tool_handler: Sear
                 with json_path.open("r", encoding="utf-8") as jf:
                     meta = json.load(jf)
                     qid_saved = meta.get("query_id")
-                    if qid_saved:
+                    if qid_saved and meta.get("status") == "completed":
                         processed_ids.add(str(qid_saved))
             except Exception:
                 continue
@@ -441,46 +487,42 @@ def _process_tsv_dataset(tsv_path: str, client: OpenAI, args, tool_handler: Sear
             return True
 
     def _handle_single_query(qid: str, qtext: str, pbar=None):
-        try:
-            raw_dump_dir = None
-            raw_trace_name = None
-            if _should_dump_raw():
-                raw_dump_dir = str(Path(args.output_dir) / "raw_responses")
-                raw_trace_name = f"query_{qid}"
+        raw_dump_dir = None
+        raw_trace_name = None
+        if _should_dump_raw():
+            raw_dump_dir = str(Path(args.output_dir) / "raw_responses")
+            raw_trace_name = f"query_{qid}"
 
-            normalized_results, cumulative_usage, finish_reason = run_conversation_with_tools(
-                client,
-                query=qtext,
-                model=args.model,
-                max_tokens=args.max_tokens,
-                tool_handler=tool_handler,
-                system_prompt=args.system,
-                query_template=args.query_template,
-                temperature=args.temperature,
-                top_p=args.top_p,
-                max_iterations=args.max_iterations,
-                raw_dump_dir=raw_dump_dir,
-                raw_trace_name=raw_trace_name,
-            )
+        normalized_results, cumulative_usage, finish_reason = run_conversation_with_tools(
+            client,
+            query=qtext,
+            model=args.model,
+            max_tokens=args.max_tokens,
+            tool_handler=tool_handler,
+            system_prompt=args.system,
+            query_template=args.query_template,
+            temperature=args.temperature,
+            top_p=args.top_p,
+            max_iterations=args.max_iterations,
+            raw_dump_dir=raw_dump_dir,
+            raw_trace_name=raw_trace_name,
+        )
 
-            with completed_lock:
-                completed_count[0] += 1
-                if pbar:
-                    pbar.set_postfix(completed=completed_count[0])
+        with completed_lock:
+            completed_count[0] += 1
+            if pbar:
+                pbar.set_postfix(completed=completed_count[0])
 
-            _persist_response(
-                args.output_dir,
-                model=args.model,
-                query_id=qid,
-                system_prompt=args.system,
-                max_tokens=args.max_tokens,
-                normalized_results=normalized_results,
-                cumulative_usage=cumulative_usage,
-                finish_reason=finish_reason,
-            )
-        except Exception as exc:
-            print(f"[Error] Query id={qid} failed: {exc}")
-            sys.exit(1)
+        _persist_response(
+            args.output_dir,
+            model=args.model,
+            query_id=qid,
+            system_prompt=args.system,
+            max_tokens=args.max_tokens,
+            normalized_results=normalized_results,
+            cumulative_usage=cumulative_usage,
+            finish_reason=finish_reason,
+        )
 
     if args.num_threads <= 1:
         with tqdm(remaining, desc="Queries", unit="query") as pbar:
@@ -489,9 +531,27 @@ def _process_tsv_dataset(tsv_path: str, client: OpenAI, args, tool_handler: Sear
     else:
         with ThreadPoolExecutor(max_workers=args.num_threads) as executor, \
             tqdm(total=len(remaining), desc="Queries", unit="query") as pbar:
-            futures = [executor.submit(_handle_single_query, qid, qtext, pbar) for qid, qtext in remaining]
-            for _ in as_completed(futures):
-                pbar.update(1)
+            future_to_qid = {
+                executor.submit(_handle_single_query, qid, qtext, pbar): qid
+                for qid, qtext in remaining
+            }
+            failures: list[tuple[str, Exception]] = []
+            for future in as_completed(future_to_qid):
+                qid = future_to_qid[future]
+                try:
+                    future.result()
+                except Exception as exc:
+                    print(f"[Error] Query id={qid} failed: {exc}")
+                    failures.append((qid, exc))
+                finally:
+                    pbar.update(1)
+
+            if failures:
+                failed_qids = ", ".join(qid for qid, _ in failures[:20])
+                suffix = " ..." if len(failures) > 20 else ""
+                raise RuntimeError(
+                    f"{len(failures)} query runs failed. Query ids: {failed_qids}{suffix}"
+                )
 
 
 def main():
