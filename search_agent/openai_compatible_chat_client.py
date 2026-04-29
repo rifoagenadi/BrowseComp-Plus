@@ -154,6 +154,79 @@ def _safe_trace_name(value: str | None) -> str:
     return normalized or "single"
 
 
+def _safe_json_value(value: Any) -> Any:
+    if value is None or isinstance(value, str | int | float | bool):
+        return value
+    if isinstance(value, dict):
+        return {str(k): _safe_json_value(v) for k, v in value.items()}
+    if isinstance(value, list | tuple):
+        return [_safe_json_value(item) for item in value]
+    return str(value)
+
+
+def _exception_payload(error: Exception) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "type": type(error).__name__,
+        "message": str(error),
+    }
+
+    for attr in ("status_code", "code", "param", "request_id"):
+        value = getattr(error, attr, None)
+        if value is not None:
+            payload[attr] = _safe_json_value(value)
+
+    body = getattr(error, "body", None)
+    if body is not None:
+        payload["body"] = _safe_json_value(body)
+
+    response = getattr(error, "response", None)
+    if response is not None:
+        status_code = getattr(response, "status_code", None)
+        if status_code is not None:
+            payload["status_code"] = status_code
+        url = getattr(response, "url", None)
+        if url:
+            payload["url"] = str(url)
+        response_text = getattr(response, "text", "")
+        if isinstance(response_text, str) and response_text.strip():
+            payload["response_text"] = response_text.strip()[:1000]
+
+    return payload
+
+
+def _persist_failed_query(out_dir: str, *, model: str, query_id: str, args, error: Exception) -> None:
+    error_payload = _exception_payload(error)
+    normalized_results = [
+        {
+            "type": "output_text",
+            "tool_name": None,
+            "arguments": None,
+            "output": (
+                "Explanation: The query failed due to a harness or model API error.\n"
+                "Exact Answer: None\n"
+                "Confidence: 0%"
+            ),
+            "error": error_payload,
+        }
+    ]
+    _persist_response(
+        out_dir,
+        model=model,
+        query_id=query_id,
+        system_prompt=args.system,
+        max_tokens=args.max_tokens,
+        normalized_results=normalized_results,
+        cumulative_usage={
+            "prompt_tokens": 0,
+            "prompt_tokens_cached": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+            "reasoning_tokens": 0,
+        },
+        finish_reason="failed",
+    )
+
+
 def _dump_raw_iteration(
     dump_root: str | None,
     trace_name: str | None,
@@ -470,6 +543,7 @@ def _process_tsv_dataset(tsv_path: str, client: OpenAI, args, tool_handler: Sear
         f"Processing {len(remaining)} remaining queries (skipping {len(processed_ids)}) from {dataset_path} ..."
     )
 
+    failures: list[tuple[str, Exception]] = []
     completed_lock = threading.Lock()
     completed_count = [0]
     dump_limit = args.dump_raw_limit
@@ -527,7 +601,12 @@ def _process_tsv_dataset(tsv_path: str, client: OpenAI, args, tool_handler: Sear
     if args.num_threads <= 1:
         with tqdm(remaining, desc="Queries", unit="query") as pbar:
             for qid, qtext in pbar:
-                _handle_single_query(qid, qtext, pbar)
+                try:
+                    _handle_single_query(qid, qtext, pbar)
+                except Exception as exc:
+                    print(f"[Error] Query id={qid} failed: {exc}")
+                    _persist_failed_query(args.output_dir, model=args.model, query_id=qid, args=args, error=exc)
+                    failures.append((qid, exc))
     else:
         with ThreadPoolExecutor(max_workers=args.num_threads) as executor, \
             tqdm(total=len(remaining), desc="Queries", unit="query") as pbar:
@@ -535,23 +614,24 @@ def _process_tsv_dataset(tsv_path: str, client: OpenAI, args, tool_handler: Sear
                 executor.submit(_handle_single_query, qid, qtext, pbar): qid
                 for qid, qtext in remaining
             }
-            failures: list[tuple[str, Exception]] = []
             for future in as_completed(future_to_qid):
                 qid = future_to_qid[future]
                 try:
                     future.result()
                 except Exception as exc:
                     print(f"[Error] Query id={qid} failed: {exc}")
+                    _persist_failed_query(args.output_dir, model=args.model, query_id=qid, args=args, error=exc)
                     failures.append((qid, exc))
                 finally:
                     pbar.update(1)
 
-            if failures:
-                failed_qids = ", ".join(qid for qid, _ in failures[:20])
-                suffix = " ..." if len(failures) > 20 else ""
-                raise RuntimeError(
-                    f"{len(failures)} query runs failed. Query ids: {failed_qids}{suffix}"
-                )
+    if failures:
+        failed_qids = ", ".join(qid for qid, _ in failures[:20])
+        suffix = " ..." if len(failures) > 20 else ""
+        message = f"{len(failures)} query runs failed. Query ids: {failed_qids}{suffix}"
+        if args.fail_on_query_error:
+            raise RuntimeError(message)
+        print(f"[Warning] {message}. Failed query records were saved with status='failed'.")
 
 
 def main():
@@ -603,6 +683,11 @@ def main():
         type=int,
         default=None,
         help="Maximum number of dataset queries to dump when --dump-raw-responses is enabled. Default: dump all.",
+    )
+    parser.add_argument(
+        "--fail-on-query-error",
+        action="store_true",
+        help="Exit non-zero if any dataset query fails. By default, failed queries are saved with status='failed' and the run continues.",
     )
 
     parser.add_argument(
